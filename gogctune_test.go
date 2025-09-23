@@ -1,135 +1,120 @@
 package gogctune
 
 import (
-	"context"
-	"io"
 	"log"
+	"os"
+	"runtime"
 	"runtime/debug"
 	"testing"
 	"time"
 )
 
-// --- Utility Function Tests ---
+func newLogger() *log.Logger {
+	return log.New(os.Stdout, "[test] ", log.LstdFlags)
+}
 
-func TestClamp(t *testing.T) {
-	testCases := []struct {
-		name     string
-		value    int
-		min      int
-		max      int
-		expected int
-	}{
-		{"Value below min", 10, 20, 200, 20},
-		{"Value above max", 250, 20, 200, 200},
-		{"Value within range", 100, 20, 200, 100},
-		{"Value at min", 20, 20, 200, 20},
-		{"Value at max", 200, 20, 200, 200},
-	}
+//
+// ==== BalancedPolicy Tests ====
+//
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := clamp(tc.value, tc.min, tc.max); got != tc.expected {
-				t.Errorf("clamp(%d, %d, %d) = %d; want %d", tc.value, tc.min, tc.max, got, tc.expected)
-			}
-		})
+func TestBalancedPolicy_CPUHigh_IncreasesGOGC(t *testing.T) {
+	p := NewBalancedPolicy(newLogger())
+
+	// Pretend previous stats
+	p.state.prevGCStats = debug.GCStats{LastGC: time.Now().Add(-1 * time.Second), PauseTotal: 10 * time.Millisecond}
+	// Current stats -> high CPU fraction
+	currGC := debug.GCStats{LastGC: time.Now(), PauseTotal: 200 * time.Millisecond}
+
+	newGOGC := p.NextGOGC(100, runtime.MemStats{HeapAlloc: 100 << 20}, currGC)
+	if newGOGC <= 100 {
+		t.Errorf("expected GOGC increase, got %d", newGOGC)
 	}
 }
 
-func TestCalculateEMA(t *testing.T) {
-	// Simple case to ensure the formula is applied correctly.
-	previousEMA := 10.0
-	currentValue := 20.0
-	alpha := 0.2
-	expected := (alpha * currentValue) + ((1 - alpha) * previousEMA) // 0.2*20 + 0.8*10 = 4 + 8 = 12
+func TestBalancedPolicy_HighHeapGrowth_DecreasesGOGC(t *testing.T) {
+	p := NewBalancedPolicy(newLogger())
 
-	if got := calculateEMA(currentValue, previousEMA, alpha); got != expected {
-		t.Errorf("calculateEMA() = %f; want %f", got, expected)
+	p.state.prevMemStats = runtime.MemStats{HeapAlloc: 100 << 20}
+	currMem := runtime.MemStats{HeapAlloc: 200 << 20}
+
+	newGOGC := p.NextGOGC(100, currMem, debug.GCStats{})
+	if newGOGC >= 100 {
+		t.Errorf("expected GOGC decrease, got %d", newGOGC)
 	}
 }
 
-// --- Policy Logic Tests ---
+func TestBalancedPolicy_Idle_DecreasesSlowly(t *testing.T) {
+	p := NewBalancedPolicy(newLogger())
 
-// Note: Testing the policies perfectly is hard as it requires mocking runtime stats.
-// These tests focus on ensuring the core decision tree logic works as expected given certain inputs.
+	// Simulate very low GC CPU fraction
+	p.state.emaGCCPUFraction = 0.0
+	p.state.prevGCStats = debug.GCStats{LastGC: time.Now().Add(-10 * time.Second)}
 
-func TestBalancedPolicy_CPUResponse(t *testing.T) {
-	logger := log.New(io.Discard, "", 0)
-	p := NewBalancedPolicy(logger).(*balancedPolicy)
-	p.isFirstRun = false
-	p.emaGCCPUFraction = 0.05 // Above the 0.04 threshold
-
-	currentGOGC := 100
-	newGOGC := p.Decide(currentGOGC, 5*time.Second)
-
-	if newGOGC <= currentGOGC {
-		t.Errorf("Expected GOGC to increase on high CPU, but it went from %d to %d", currentGOGC, newGOGC)
+	newGOGC := p.NextGOGC(100, runtime.MemStats{}, debug.GCStats{LastGC: time.Now()})
+	if newGOGC != 98 { // 100 - GOGCSlowDecStep
+		t.Errorf("expected slow decrease, got %d", newGOGC)
 	}
 }
 
-func TestFavorMemoryPolicy_SafetyValve(t *testing.T) {
-	logger := log.New(io.Discard, "", 0)
-	p := NewFavorMemoryPolicy(logger).(*favorMemoryPolicy)
-	p.isFirstRun = false
-	p.emaGCCPUFraction = 0.20                                // Above the 0.15 emergency threshold
-	p.highCPUSustainCounter = p.emergencySustainDuration - 1 // One tick away from triggering
+//
+// ==== FavorMemoryPolicy Tests ====
+//
 
-	currentGOGC := 20
-	newGOGC := p.Decide(currentGOGC, 5*time.Second)
+func TestFavorMemoryPolicy_AggressiveDecrease(t *testing.T) {
+	p := NewFavorMemoryPolicy(newLogger())
 
-	if newGOGC != p.emergencyGOGCValue {
-		t.Errorf("Expected safety valve to trigger and set GOGC to %d, but got %d", p.emergencyGOGCValue, newGOGC)
+	newGOGC := p.NextGOGC(100, runtime.MemStats{}, debug.GCStats{})
+	if newGOGC >= 100 {
+		t.Errorf("expected GOGC decrease, got %d", newGOGC)
 	}
 }
 
-func TestFavorCPUPolicy_SafetyValve(t *testing.T) {
-	logger := log.New(io.Discard, "", 0)
-	p := NewFavorCPUPolicy(logger).(*favorCPUPolicy)
-	// Manually set a low memory cap for testing
-	p.memoryCapBytes = 100 * 1024 * 1024 // 100MB
+func TestFavorMemoryPolicy_EmergencyCPU(t *testing.T) {
+	p := NewFavorMemoryPolicy(newLogger())
 
-	// To simulate high memory, we can't directly mock runtime.ReadMemStats.
-	// This test is more of a placeholder showing the intent. A real test
-	// would require a more complex setup with interfaces.
-	// For now, we assume if we could set HeapAlloc > memoryCapBytes,
-	// the policy should return p.oomPreventionGOGC.
-	t.Log("Skipping direct test for FavorCPU safety valve due to inability to mock runtime.MemStats easily.")
+	// Simulate high CPU fraction for multiple intervals
+	for i := 0; i < p.EmergencySustain; i++ {
+		p.state.prevGCStats = debug.GCStats{LastGC: time.Now().Add(-1 * time.Second), PauseTotal: 10 * time.Millisecond}
+		currGC := debug.GCStats{LastGC: time.Now(), PauseTotal: 500 * time.Millisecond}
+		newGOGC := p.NextGOGC(50, runtime.MemStats{}, currGC)
+
+		if i == p.EmergencySustain-1 && newGOGC != p.EmergencyGOGCValue {
+			t.Errorf("expected emergency GOGC=%d, got %d", p.EmergencyGOGCValue, newGOGC)
+		}
+	}
 }
 
-// --- Tuner Lifecycle Test ---
+//
+// ==== FavorCPUPolicy Tests ====
+//
 
-func TestStartStop(t *testing.T) {
-	logger := log.New(io.Discard, "", 0)
-	policy := NewBalancedPolicy(logger)
+func TestFavorCPUPolicy_IncreaseAggressively(t *testing.T) {
+	p := NewFavorCPUPolicy(newLogger())
 
-	// Get initial GOGC
-	initialGOGC := debug.SetGCPercent(-1)
-	defer debug.SetGCPercent(initialGOGC) // Restore it after test
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	stop, err := Start(ctx, policy)
-	if err != nil {
-		t.Fatalf("Start() returned an error: %v", err)
+	newGOGC := p.NextGOGC(100, runtime.MemStats{HeapAlloc: 10 << 20}, debug.GCStats{})
+	if newGOGC <= 100 {
+		t.Errorf("expected GOGC increase, got %d", newGOGC)
 	}
+}
 
-	// Let the tuner run for a very short time
-	time.Sleep(10 * time.Millisecond)
+func TestFavorCPUPolicy_OOMPrevention(t *testing.T) {
+	p := NewFavorCPUPolicy(newLogger())
+	p.totalMem = 100 << 20                     // 100 MB total memory
+	m := runtime.MemStats{HeapAlloc: 90 << 20} // 90% usage
 
-	// Stop the tuner
-	stop()
+	newGOGC := p.NextGOGC(200, m, debug.GCStats{})
+	if newGOGC != p.OOMPreventionGOGC {
+		t.Errorf("expected OOM prevention GOGC=%d, got %d", p.OOMPreventionGOGC, newGOGC)
+	}
+}
 
-	// Use a timeout to ensure the tuner actually stops
-	select {
-	case <-time.After(1 * time.Second):
-		t.Error("Tuner did not stop within the expected time")
-	// If the tuner's 'done' channel was accessible, we could read from it here.
-	// Since it's not, we rely on the stop function returning promptly.
-	case <-func() chan struct{} {
-		c := make(chan struct{})
-		close(c)
-		return c
-	}():
-		// Test passed
+func TestFavorCPUPolicy_TimeBasedTrigger(t *testing.T) {
+	p := NewFavorCPUPolicy(newLogger())
+	p.totalMem = 1 << 30 // 1GB
+	p.state.lastGCTime = time.Now().Add(-10 * time.Minute)
+
+	newGOGC := p.NextGOGC(200, runtime.MemStats{HeapAlloc: 100 << 20}, debug.GCStats{})
+	if newGOGC != 100 {
+		t.Errorf("expected time-based trigger GOGC=100, got %d", newGOGC)
 	}
 }
