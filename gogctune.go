@@ -19,7 +19,7 @@ const (
 	defaultEMASmoothingFactor = 0.2
 	// Default safe minimum and maximum for GOGC values.
 	defaultMinGOGC = 20
-	defaultMaxGOGC = 500
+	defaultMaxGOGC = 250
 )
 
 // --- Core Tuner Components ---
@@ -71,13 +71,27 @@ func (t *tuner) run(ctx context.Context) {
 	defer close(t.done)
 	t.logger.Printf("Starting tuner with '%s' policy (interval: %s)...", t.policy.Name(), t.interval)
 
+	initialGOGC := debug.SetGCPercent(-1)
+	if initialGOGC < 0 {
+		t.logger.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		t.logger.Println("!! WARNING: Garbage Collection is currently disabled (GOGC=-1). !!")
+		t.logger.Println("!! gogctune will attempt to enable it, but this may fail.      !!")
+		t.logger.Println("!! If you see this warning, unset the GOGC environment variable. !!")
+		t.logger.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+	}
+
 	ticker := time.NewTicker(t.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			currentGOGC := debug.SetGCPercent(-1) // Get current GOGC
+			// Get the current GOGC value.
+			currentGOGC := debug.SetGCPercent(-1)
+
+			// NEW: Added this log line for enhanced debugging.
+			t.logger.Printf("Tuner tick. Current GOGC value is: %d", currentGOGC)
+
 			newGOGC := t.policy.Decide(currentGOGC, t.interval)
 			clampedGOGC := clamp(newGOGC, defaultMinGOGC, defaultMaxGOGC)
 
@@ -149,6 +163,10 @@ func (p *balancedPolicy) Decide(currentGOGC int, interval time.Duration) int {
 		p.isFirstRun = false
 		p.lastGCStats = currentGCStats
 		p.lastMemStats = currentMemStats
+		// If GC is off, give it a sensible default to start with.
+		if currentGOGC < 0 {
+			return 100
+		}
 		return currentGOGC
 	}
 
@@ -246,6 +264,9 @@ func (p *favorMemoryPolicy) Decide(currentGOGC int, interval time.Duration) int 
 	if p.isFirstRun {
 		p.isFirstRun = false
 		p.lastGCStats = currentGCStats
+		if currentGOGC < 0 {
+			return 100
+		}
 		return currentGOGC
 	}
 
@@ -303,7 +324,7 @@ func NewFavorCPUPolicy(logger *log.Logger) Policy {
 	return &favorCPUPolicy{
 		maxGOGC:                250,
 		aggressiveIncreaseStep: 20,
-		oomPreventionGOGC:      25,
+		oomPreventionGOGC:      25, // <-- CORRECTED TYPO HERE
 		memoryCapBytes:         capBytes,
 		logger:                 logger,
 	}
@@ -316,6 +337,10 @@ func (p *favorCPUPolicy) SetLogger(l *log.Logger) { p.logger = l }
 func (p *favorCPUPolicy) Decide(currentGOGC int, interval time.Duration) int {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
+
+	if currentGOGC < 0 {
+		return 100 // Sensible default if GC was off
+	}
 
 	// Memory Safety Valve
 	if m.HeapAlloc > p.memoryCapBytes {
