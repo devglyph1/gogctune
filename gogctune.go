@@ -1,220 +1,337 @@
-// Package gogctune provides a dynamic, adaptive mechanism for automatically tuning
-// the GOGC environment variable in real-time. It monitors application and garbage
-// collector (GC) metrics to balance memory usage and CPU overhead according to
-// user-defined policies. This helps in optimizing application performance without
-// manual GOGC tuning.
 package gogctune
 
 import (
 	"context"
 	"log"
-	"os"
 	"runtime"
 	"runtime/debug"
-	"sync"
 	"time"
+
+	"github.com/shirou/gopsutil/v3/mem" // Required for FavorCPU policy's memory cap
 )
 
-// Logger is a simple interface for logging. It's compatible with the standard library's log.Logger.
-type Logger interface {
-	Printf(format string, v ...interface{})
+// --- Constants and Default Configuration ---
+
+const (
+	// Default interval for the tuner to make decisions.
+	defaultDecisionInterval = 5 * time.Second
+	// Default smoothing factor (alpha) for Exponential Moving Average.
+	defaultEMASmoothingFactor = 0.2
+	// Default safe minimum and maximum for GOGC values.
+	defaultMinGOGC = 20
+	defaultMaxGOGC = 500
+)
+
+// --- Core Tuner Components ---
+
+// Policy defines the interface for a tuning strategy.
+type Policy interface {
+	// Name returns the name of the policy.
+	Name() string
+	// Decide makes a tuning decision based on the current and previous stats.
+	Decide(currentGOGC int, interval time.Duration) int
+	// SetLogger sets the logger for the policy.
+	SetLogger(logger *log.Logger)
 }
 
-// DefaultLogger is used if no logger is provided in the configuration.
-var defaultLogger = log.New(os.Stderr, "[gogctune] ", log.LstdFlags)
-
-// Tuner manages the GOGC tuning lifecycle.
-type Tuner struct {
-	// config holds the tuner's configuration.
-	config *Config
-	// stopChan is used to signal the tuning goroutine to stop.
-	stopChan chan struct{}
-	// wg is used to wait for the tuning goroutine to finish.
-	wg sync.WaitGroup
-	// mu protects against concurrent calls to Tune and Stop.
-	mu sync.Mutex
-	// isRunning tracks if the tuner is currently active.
-	isRunning bool
+// tuner is the main control structure that runs the decision loop.
+type tuner struct {
+	policy   Policy
+	interval time.Duration
+	cancel   context.CancelFunc
+	done     chan struct{}
+	logger   *log.Logger
 }
 
-// Config holds the configuration for the Tuner.
-type Config struct {
-	// Policy is the tuning strategy to use. Required.
-	Policy Policy
-	// Interval is the time between tuning adjustments.
-	// A smaller interval is more responsive but may have more overhead.
-	// Default: 10 seconds.
-	Interval time.Duration
-	// Logger is the logger to use for output.
-	// If nil, a default logger writing to stderr is used.
-	Logger Logger
-}
-
-// New creates a new Tuner with the given configuration.
-func New(config *Config) *Tuner {
-	// Set default values for configuration if not provided.
-	if config.Interval <= 0 {
-		config.Interval = 10 * time.Second
+// Start initializes and starts the GOGC tuner with a given policy.
+// It returns a function that can be called to stop the tuner gracefully.
+func Start(ctx context.Context, policy Policy) (stopFunc func(), err error) {
+	t := &tuner{
+		policy:   policy,
+		interval: defaultDecisionInterval,
+		done:     make(chan struct{}),
+		logger:   log.New(log.Writer(), "[gogctune] ", log.LstdFlags),
 	}
-	if config.Logger == nil {
-		config.Logger = defaultLogger
-	}
-	return &Tuner{
-		config:   config,
-		stopChan: make(chan struct{}),
-	}
+	policy.SetLogger(t.logger)
+
+	var tCtx context.Context
+	tCtx, t.cancel = context.WithCancel(ctx)
+
+	go t.run(tCtx)
+
+	// Return a function to gracefully stop the tuner.
+	return func() {
+		t.cancel()
+		<-t.done
+	}, nil
 }
 
-// Tune starts the GOGC tuning process in a new goroutine.
-// It returns a function that can be called to stop the tuner.
-func (t *Tuner) Tune(ctx context.Context) (stop func()) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+// run is the main loop that periodically triggers the policy's decision logic.
+func (t *tuner) run(ctx context.Context) {
+	defer close(t.done)
+	t.logger.Printf("Starting tuner with '%s' policy (interval: %s)...", t.policy.Name(), t.interval)
 
-	// If already running, do nothing.
-	if t.isRunning {
-		t.config.Logger.Printf("Tuner is already running.")
-		return func() {}
-	}
-
-	t.config.Logger.Printf("Starting GOGC tuner with a %s policy and %.1fs interval",
-		t.config.Policy.Name(), t.config.Interval.Seconds())
-
-	t.isRunning = true
-	t.wg.Add(1)
-	t.stopChan = make(chan struct{})
-
-	go t.run(ctx)
-
-	// Return a stop function that is safe to call multiple times.
-	return sync.OnceFunc(t.Stop)
-}
-
-// Stop gracefully stops the tuner and waits for it to exit.
-func (t *Tuner) Stop() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if !t.isRunning {
-		return
-	}
-
-	t.config.Logger.Printf("Stopping GOGC tuner...")
-	close(t.stopChan)
-	t.wg.Wait()
-	t.isRunning = false
-	t.config.Logger.Printf("GOGC tuner stopped.")
-}
-
-// run is the main loop for the tuner. It periodically calls the policy to adjust GOGC.
-func (t *Tuner) run(ctx context.Context) {
-	defer t.wg.Done()
-
-	// Initialize the policy with current stats.
-	t.config.Policy.Initialize()
-
-	ticker := time.NewTicker(t.config.Interval)
+	ticker := time.NewTicker(t.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			// Calculate the recommended GOGC value.
-			newGOGC := t.config.Policy.Recommend()
-			// Get the current GOGC value.
-			currentGOGC := debug.SetGCPercent(-1)
-			debug.SetGCPercent(currentGOGC)
+			currentGOGC := debug.SetGCPercent(-1) // Get current GOGC
+			newGOGC := t.policy.Decide(currentGOGC, t.interval)
+			clampedGOGC := clamp(newGOGC, defaultMinGOGC, defaultMaxGOGC)
 
-			// Apply the new value only if it's different from the current one.
-			if newGOGC != currentGOGC {
-				debug.SetGCPercent(newGOGC)
-				t.config.Logger.Printf("GOGC adjusted from %d to %d", currentGOGC, newGOGC)
+			if clampedGOGC != currentGOGC {
+				debug.SetGCPercent(clampedGOGC)
+				t.logger.Printf("Adjusted GOGC from %d to %d", currentGOGC, clampedGOGC)
 			}
-		case <-t.stopChan:
-			// Exit loop if Stop() was called.
-			return
 		case <-ctx.Done():
-			// Exit loop if the parent context is cancelled.
-			t.Stop()
+			t.logger.Println("Stopping tuner...")
 			return
 		}
 	}
 }
 
-// --- Tuning Policies ---
+// --- Balanced Policy ---
 
-// Policy defines the interface for a GOGC tuning strategy.
-type Policy interface {
-	// Initialize is called once before the tuning loop starts to set up initial state.
-	Initialize()
-	// Recommend calculates and returns the recommended GOGC value based on current metrics.
-	Recommend() int
-	// Name returns the name of the policy.
-	Name() string
+type balancedPolicy struct {
+	// Configuration
+	targetCPUFractionLow     float64
+	targetCPUFractionHigh    float64
+	highHeapGrowthThreshold  float64
+	gogcIncreaseFactor       float64
+	gogcModerateDecreaseStep int
+	gogcSlowDecreaseStep     int
+	cooldownIntervals        int
+
+	// State
+	lastGCStats       debug.GCStats
+	lastMemStats      runtime.MemStats
+	emaGCCPUFraction  float64
+	emaHeapGrowthRate float64
+	lastAction        int // -1 for decrease, 1 for increase
+	cooldownCounter   int
+	isFirstRun        bool
+	logger            *log.Logger
 }
 
-// statefulPolicy provides a base for policies that need to track metrics over time.
-type statefulPolicy struct {
-	// logger for policy-specific logging.
-	logger Logger
-	// lastGCStats stores the GC stats from the previous cycle.
-	lastGCStats debug.GCStats
-	// lastMemStats stores the memory stats from the previous cycle.
-	lastMemStats runtime.MemStats
-	// gcCPUFractionEMA is the Exponential Moving Average of the GC CPU fraction.
-	// It helps smooth out short-term spikes.
-	gcCPUFractionEMA float64
-	// alpha is the smoothing factor for the EMA. A smaller alpha results in smoother values.
-	alpha float64
+const (
+	actionDecrease = -1
+	actionIncrease = 1
+)
+
+// NewBalancedPolicy creates a new policy that balances CPU and memory.
+func NewBalancedPolicy(logger *log.Logger) Policy {
+	return &balancedPolicy{
+		targetCPUFractionLow:     0.02,
+		targetCPUFractionHigh:    0.04,
+		highHeapGrowthThreshold:  0.20,
+		gogcIncreaseFactor:       200.0,
+		gogcModerateDecreaseStep: 10,
+		gogcSlowDecreaseStep:     2,
+		cooldownIntervals:        3,
+		isFirstRun:               true,
+		logger:                   logger,
+	}
 }
 
-// Initialize captures the initial GC and memory statistics.
-func (p *statefulPolicy) Initialize() {
-	debug.ReadGCStats(&p.lastGCStats)
-	runtime.ReadMemStats(&p.lastMemStats)
-	// Seed EMA with an initial reasonable value
-	p.gcCPUFractionEMA = 0.03 // Assume 3% to start
+func (p *balancedPolicy) Name() string { return "Balanced" }
+
+func (p *balancedPolicy) SetLogger(l *log.Logger) { p.logger = l }
+
+func (p *balancedPolicy) Decide(currentGOGC int, interval time.Duration) int {
+	var currentGCStats debug.GCStats
+	var currentMemStats runtime.MemStats
+	debug.ReadGCStats(&currentGCStats)
+	runtime.ReadMemStats(&currentMemStats)
+
+	if p.isFirstRun {
+		p.isFirstRun = false
+		p.lastGCStats = currentGCStats
+		p.lastMemStats = currentMemStats
+		return currentGOGC
+	}
+
+	// Calculate metrics for the specific interval
+	deltaPauseNS := currentGCStats.PauseTotal - p.lastGCStats.PauseTotal
+	intervalCPUFraction := float64(deltaPauseNS) / float64(interval.Nanoseconds())
+
+	var heapGrowthRate float64
+	if p.lastMemStats.HeapAlloc > 0 {
+		heapGrowthRate = float64(currentMemStats.HeapAlloc-p.lastMemStats.HeapAlloc) / float64(p.lastMemStats.HeapAlloc)
+	}
+
+	// Update smoothed metrics
+	p.emaGCCPUFraction = calculateEMA(intervalCPUFraction, p.emaGCCPUFraction, defaultEMASmoothingFactor)
+	p.emaHeapGrowthRate = calculateEMA(heapGrowthRate, p.emaHeapGrowthRate, defaultEMASmoothingFactor)
+
+	p.logger.Printf("CPU Fraction (EMA): %.4f, Heap Growth (EMA): %.4f", p.emaGCCPUFraction, p.emaHeapGrowthRate)
+
+	newGOGC := currentGOGC
+
+	// Update cooldown counter
+	if p.cooldownCounter > 0 {
+		p.cooldownCounter--
+	}
+
+	// Decision Tree
+	if p.emaGCCPUFraction > p.targetCPUFractionHigh {
+		// CPU-First Response: GC is too expensive
+		cpuOvershoot := p.emaGCCPUFraction - p.targetCPUFractionHigh
+		increaseAmount := int(cpuOvershoot * p.gogcIncreaseFactor)
+		newGOGC = currentGOGC + increaseAmount
+		p.lastAction = actionIncrease
+		p.cooldownCounter = p.cooldownIntervals
+		p.logger.Printf("Action: CPU-First Response. Increasing GOGC by %d.", increaseAmount)
+	} else if p.emaGCCPUFraction <= p.targetCPUFractionHigh && p.emaHeapGrowthRate > p.highHeapGrowthThreshold {
+		// Memory Response: CPU is fine, but memory is growing fast
+		if p.lastAction != actionIncrease || p.cooldownCounter == 0 {
+			newGOGC = currentGOGC - p.gogcModerateDecreaseStep
+			p.lastAction = actionDecrease
+			p.logger.Printf("Action: Memory Response. Decreasing GOGC by %d.", p.gogcModerateDecreaseStep)
+		}
+	} else if p.emaGCCPUFraction < p.targetCPUFractionLow {
+		// Optimization Mode: System is idle, reclaim memory
+		if p.lastAction != actionIncrease || p.cooldownCounter == 0 {
+			newGOGC = currentGOGC - p.gogcSlowDecreaseStep
+			p.lastAction = actionDecrease
+			p.logger.Printf("Action: Optimization Mode. Decreasing GOGC by %d.", p.gogcSlowDecreaseStep)
+		}
+	}
+
+	// Update state for next cycle
+	p.lastGCStats = currentGCStats
+	p.lastMemStats = currentMemStats
+
+	return newGOGC
 }
 
-// updateMetrics reads the latest stats, calculates deltas, and updates the EMA.
-func (p *statefulPolicy) updateMetrics() (heapGrowthRatio float64) {
+// --- FavorMemory Policy ---
+
+type favorMemoryPolicy struct {
+	minGOGC                  int
+	aggressiveDecreaseStep   int
+	emergencyCPUThreshold    float64
+	emergencyGOGCValue       int
+	emergencySustainDuration int
+
+	lastGCStats           debug.GCStats
+	emaGCCPUFraction      float64
+	highCPUSustainCounter int
+	isFirstRun            bool
+	logger                *log.Logger
+}
+
+// NewFavorMemoryPolicy creates a policy that aggressively saves memory.
+func NewFavorMemoryPolicy(logger *log.Logger) Policy {
+	return &favorMemoryPolicy{
+		minGOGC:                  20,
+		aggressiveDecreaseStep:   15,
+		emergencyCPUThreshold:    0.15,
+		emergencyGOGCValue:       150,
+		emergencySustainDuration: 3,
+		isFirstRun:               true,
+		logger:                   logger,
+	}
+}
+
+func (p *favorMemoryPolicy) Name() string { return "FavorMemory" }
+
+func (p *favorMemoryPolicy) SetLogger(l *log.Logger) { p.logger = l }
+
+func (p *favorMemoryPolicy) Decide(currentGOGC int, interval time.Duration) int {
 	var currentGCStats debug.GCStats
 	debug.ReadGCStats(&currentGCStats)
 
-	var currentMemStats runtime.MemStats
-	runtime.ReadMemStats(&currentMemStats)
-
-	// Calculate GC CPU fraction for the latest cycle if a GC has occurred.
-	if len(currentGCStats.Pause) > 0 && len(p.lastGCStats.Pause) > 0 && currentGCStats.NumGC > p.lastGCStats.NumGC {
-		lastGCEndTime := p.lastGCStats.LastGC
-		currentGCEndTime := currentGCStats.LastGC
-
-		if currentGCEndTime.After(lastGCEndTime) {
-			// Total time elapsed since the last GC finished.
-			totalTime := currentGCEndTime.Sub(lastGCEndTime).Seconds()
-			// CPU time spent in GC during the last cycle.
-			gcCPUTime := currentGCStats.PauseTotal.Seconds() - p.lastGCStats.PauseTotal.Seconds()
-
-			if totalTime > 0 {
-				gcCPUFraction := gcCPUTime / totalTime
-				// Update EMA
-				p.gcCPUFractionEMA = p.alpha*gcCPUFraction + (1-p.alpha)*p.gcCPUFractionEMA
-			}
-		}
+	if p.isFirstRun {
+		p.isFirstRun = false
+		p.lastGCStats = currentGCStats
+		return currentGOGC
 	}
 
-	// Calculate heap growth ratio.
-	if p.lastMemStats.HeapAlloc > 0 {
-		heapGrowthRatio = float64(currentMemStats.HeapAlloc-p.lastMemStats.HeapAlloc) / float64(p.lastMemStats.HeapAlloc)
+	deltaPauseNS := currentGCStats.PauseTotal - p.lastGCStats.PauseTotal
+	intervalCPUFraction := float64(deltaPauseNS) / float64(interval.Nanoseconds())
+	p.emaGCCPUFraction = calculateEMA(intervalCPUFraction, p.emaGCCPUFraction, defaultEMASmoothingFactor)
+
+	// CPU Safety Valve
+	if p.emaGCCPUFraction > p.emergencyCPUThreshold {
+		p.highCPUSustainCounter++
+	} else {
+		p.highCPUSustainCounter = 0 // Reset if below threshold
 	}
 
-	// Update last known stats for the next cycle.
+	if p.highCPUSustainCounter >= p.emergencySustainDuration {
+		p.logger.Printf("Action: CPU Safety Valve Triggered. Setting GOGC to emergency value %d.", p.emergencyGOGCValue)
+		p.highCPUSustainCounter = 0 // Reset after triggering
+		p.lastGCStats = currentGCStats
+		return p.emergencyGOGCValue
+	}
+
+	// Default Aggressive Reduction
+	newGOGC := currentGOGC - p.aggressiveDecreaseStep
+	p.logger.Printf("Action: Aggressive Reduction. Decreasing GOGC by %d.", p.aggressiveDecreaseStep)
+
 	p.lastGCStats = currentGCStats
-	p.lastMemStats = currentMemStats
-	return heapGrowthRatio
+	return newGOGC
 }
 
-// clamp ensures the GOGC value stays within a safe, reasonable range.
+// --- FavorCPU Policy ---
+
+type favorCPUPolicy struct {
+	maxGOGC                int
+	aggressiveIncreaseStep int
+	oomPreventionGOGC      int
+	memoryCapBytes         uint64
+
+	logger *log.Logger
+}
+
+// NewFavorCPUPolicy creates a policy that aggressively minimizes GC pauses.
+func NewFavorCPUPolicy(logger *log.Logger) Policy {
+	// Determine system memory cap once at startup.
+	v, err := mem.VirtualMemory()
+	var capBytes uint64
+	if err != nil {
+		logger.Printf("Could not get system memory, using fallback 1GB cap: %v", err)
+		capBytes = 1 * 1024 * 1024 * 1024 // 1GB fallback
+	} else {
+		capBytes = uint64(float64(v.Total) * 0.80) // 80% of total system memory
+	}
+
+	logger.Printf("FavorCPU policy initialized with a memory cap of %d MB", capBytes/1024/1024)
+
+	return &favorCPUPolicy{
+		maxGOGC:                250,
+		aggressiveIncreaseStep: 20,
+		oomPreventionGOGC:      25,
+		memoryCapBytes:         capBytes,
+		logger:                 logger,
+	}
+}
+
+func (p *favorCPUPolicy) Name() string { return "FavorCPU" }
+
+func (p *favorCPUPolicy) SetLogger(l *log.Logger) { p.logger = l }
+
+func (p *favorCPUPolicy) Decide(currentGOGC int, interval time.Duration) int {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	// Memory Safety Valve
+	if m.HeapAlloc > p.memoryCapBytes {
+		p.logger.Printf("Action: Memory Safety Valve Triggered (HeapAlloc: %d MB). Forcing GC.", m.HeapAlloc/1024/1024)
+		return p.oomPreventionGOGC
+	}
+
+	// Default Aggressive Increase
+	newGOGC := currentGOGC + p.aggressiveIncreaseStep
+	p.logger.Printf("Action: Aggressive Increase. Increasing GOGC by %d.", p.aggressiveIncreaseStep)
+	return newGOGC
+}
+
+// --- Utility Functions ---
+
+// clamp ensures a value stays within a min/max range.
 func clamp(value, min, max int) int {
 	if value < min {
 		return min
@@ -225,143 +342,7 @@ func clamp(value, min, max int) int {
 	return value
 }
 
-// --- FavorCPU Policy ---
-
-// FavorCPUPolicy prioritizes reducing GC CPU usage.
-// It will aggressively increase GOGC if GC CPU usage is high,
-// even at the cost of higher memory consumption.
-type FavorCPUPolicy struct {
-	statefulPolicy
-}
-
-// NewFavorCPUPolicy creates a policy that prioritizes CPU.
-func NewFavorCPUPolicy(logger Logger) Policy {
-	return &FavorCPUPolicy{
-		statefulPolicy: statefulPolicy{logger: logger, alpha: 0.2},
-	}
-}
-
-func (p *FavorCPUPolicy) Name() string { return "FavorCPU" }
-
-func (p *FavorCPUPolicy) Recommend() int {
-	p.updateMetrics()
-
-	currentGOGC := debug.SetGCPercent(-1)
-	debug.SetGCPercent(currentGOGC)
-
-	targetCPUFraction := 0.03 // Target a low 3% GC CPU fraction
-	adjustment := 0
-
-	// Proportional adjustment: the further we are from the target, the larger the adjustment.
-	if p.gcCPUFractionEMA > targetCPUFraction {
-		// If CPU usage is high, increase GOGC aggressively.
-		adjustment = int((p.gcCPUFractionEMA - targetCPUFraction) * 500) // High proportional constant
-	} else {
-		// If CPU usage is low, we can slightly decrease GOGC to reclaim memory.
-		adjustment = -5
-	}
-
-	return clamp(currentGOGC+adjustment, 50, 500) // Allow high GOGC values
-}
-
-// --- FavorMemory Policy ---
-
-// FavorMemoryPolicy prioritizes keeping memory usage low.
-// It will aggressively decrease GOGC if the heap is growing,
-// even if it means higher GC CPU usage.
-type FavorMemoryPolicy struct {
-	statefulPolicy
-}
-
-// NewFavorMemoryPolicy creates a policy that prioritizes Memory.
-func NewFavorMemoryPolicy(logger Logger) Policy {
-	return &FavorMemoryPolicy{
-		statefulPolicy: statefulPolicy{logger: logger, alpha: 0.2},
-	}
-}
-
-func (p *FavorMemoryPolicy) Name() string { return "FavorMemory" }
-
-func (p *FavorMemoryPolicy) Recommend() int {
-	heapGrowthRatio := p.updateMetrics()
-
-	currentGOGC := debug.SetGCPercent(-1)
-	debug.SetGCPercent(currentGOGC)
-
-	targetHeapGrowth := 0.10 // Target a modest 10% heap growth between cycles
-	adjustment := 0
-
-	if heapGrowthRatio > targetHeapGrowth {
-		// If heap is growing too fast, decrease GOGC aggressively.
-		adjustment = -int((heapGrowthRatio - targetHeapGrowth) * 100) // High proportional constant
-	} else if p.gcCPUFractionEMA < 0.05 { // Only increase if CPU is not under pressure
-		// If heap growth is under control, we can slightly increase GOGC.
-		adjustment = 5
-	}
-
-	return clamp(currentGOGC+adjustment, 20, 150) // Keep GOGC values low
-}
-
-// --- Balanced Policy ---
-
-// BalancedPolicy tries to find a sweet spot between CPU and memory usage.
-// It prioritizes keeping GC CPU usage stable, and only then tries to
-// optimize memory usage.
-type BalancedPolicy struct {
-	statefulPolicy
-}
-
-// NewBalancedPolicy creates a balanced policy.
-func NewBalancedPolicy(logger Logger) Policy {
-	return &BalancedPolicy{
-		statefulPolicy: statefulPolicy{logger: logger, alpha: 0.2},
-	}
-}
-
-func (p *BalancedPolicy) Name() string { return "Balanced" }
-
-func (p *BalancedPolicy) Recommend() int {
-	heapGrowthRatio := p.updateMetrics()
-
-	currentGOGC := debug.SetGCPercent(-1)
-	debug.SetGCPercent(currentGOGC)
-
-	// Define the target "sweet spot" for GC CPU Fraction
-	targetCPUFractionMin := 0.03 // 3%
-	targetCPUFractionMax := 0.05 // 5%
-
-	adjustment := 0
-
-	// Priority 1: Respond to CPU pressure first.
-	if p.gcCPUFractionEMA > targetCPUFractionMax {
-		// CPU usage is too high, increase GOGC to reduce it.
-		adjustment = int((p.gcCPUFractionEMA - targetCPUFractionMax) * 200) // Moderate proportional constant
-	} else if p.gcCPUFractionEMA < targetCPUFractionMin {
-		// CPU usage is low, we have room to reclaim memory.
-		// Priority 2: Respond to memory pressure.
-		if heapGrowthRatio > 0.15 { // 15% growth
-			// Heap is growing, but CPU is fine. Decrease GOGC moderately.
-			adjustment = -10
-		} else {
-			// Both CPU and Memory are fine, gently decrease GOGC to be more memory-efficient.
-			adjustment = -5
-		}
-	}
-	// If inside the sweet spot, do nothing and let the system stabilize.
-
-	return clamp(currentGOGC+adjustment, 50, 200) // Standard GOGC range
-}
-
-// Start is a convenience function to create and start a tuner with a default policy.
-// It returns a function that can be called to stop the tuner.
-func Start(ctx context.Context, policy Policy) (stop func(), err error) {
-	if policy == nil {
-		policy = NewBalancedPolicy(defaultLogger)
-	}
-
-	tuner := New(&Config{
-		Policy: policy,
-	})
-
-	return tuner.Tune(ctx), nil
+// calculateEMA computes the new Exponential Moving Average.
+func calculateEMA(currentValue, previousEMA, alpha float64) float64 {
+	return (alpha * currentValue) + ((1 - alpha) * previousEMA)
 }
